@@ -188,9 +188,9 @@ pub fn run() {
                 );
                 let _ = window.set_background_color(Some(color));
             }
-            // The Dock icon, before the window shows. Later changes arrive
+            // The app icon, before the window shows. Later changes arrive
             // through `notify_settings_changed`.
-            app_icon::apply(app.handle(), migration.manager.effective().app_icon);
+            app_icon::apply(app.handle(), &migration.manager.effective().app_icon);
             let atlas_config: state::AtlasConfigHandle = Arc::new(Mutex::new(migration.manager));
             app.manage(atlas_config.clone());
             commands::atlas_config::start_watcher(app.handle(), atlas_config);
@@ -734,8 +734,11 @@ pub fn run() {
             commands::shared_memory::memory_list_events,
             commands::shared_memory::memory_clear_project,
             commands::shared_memory::memory_append_event,
-            commands::memory_timeline::memory_timeline,
-            commands::memory_timeline::memory_timeline_cached,
+            commands::shared_memory::memory_list_entries,
+            commands::shared_memory::memory_edit_entry,
+            commands::shared_memory::memory_forget_entry,
+            commands::claude_memory_import::memory_claude_import_preview,
+            commands::claude_memory_import::memory_claude_import_confirm,
             commands::memory_indexer::force_reindex,
             commands::memory_indexer::memory_indexer_close_project,
             commands::models::models_list,

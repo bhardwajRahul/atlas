@@ -14,8 +14,13 @@ import {
 } from "@/features/keybindings/stores/keybindings-store";
 import { useLayoutStore } from "@/features/layout/stores/layout-store";
 import { useTerminalStore } from "@/features/terminal/stores/terminal-store";
-import { useAppStore, type AppStateWire } from "@/features/app/stores/app-store";
+import {
+  useAppStore,
+  setAppStateWritable,
+  type AppStateWire,
+} from "@/features/app/stores/app-store";
 import { useChatStore } from "@/features/chat/stores/chat-store";
+import { listenMemoryUnconsulted } from "@/features/chat/lib/agents-api";
 import {
   listenAgents,
   pluginIdForAgentId,
@@ -51,7 +56,8 @@ import { requestCloseTab } from "@/features/chat/lib/close-tab";
 import { jumpToSession } from "@/features/chat/lib/tab-project";
 import { pruneContextUsageCache } from "@/features/chat/lib/context-usage-cache";
 import { isScrollHot } from "@/lib/scroll-hot";
-import { isWindows } from "@/lib/platform";
+import { isWindows, isLinux } from "@/lib/platform";
+import type { CliStatus } from "@/features/settings/components/settings-panel";
 import { basename } from "@/lib/paths";
 import {
   hydrateAgentRegistry,
@@ -159,12 +165,22 @@ export function App() {
   // app still works without the helper, the user just can't type
   // `atlas ./` in their terminal until they hit the install button
   // in Settings → General. Not on Windows: the helper is a bash script
-  // (see `commands::cli::cli_install_helper`).
+  // (see `commands::cli::cli_install_helper`). On Linux, skip if a
+  // system-wide /usr/bin/atlas exists so ~/.local/bin/atlas does not shadow it.
   useEffect(() => {
     if (isWindows) return;
-    void invoke("cli_install_helper").catch((e) => {
-      console.warn("atlas CLI helper refresh failed:", e);
-    });
+    void invoke<CliStatus>("cli_status")
+      .then((status) => {
+        // If installed system-wide outside ~/.local/ (e.g. /usr/bin/atlas on Linux), don't shadow it
+        if (status?.installed && status.path && !status.path.includes("/.local/")) return;
+        // If already installed and up to date on Linux, skip (macOS re-runs to self-heal edited/deleted helpers)
+        if (isLinux && status?.installed && status.installedVersion === status.currentVersion)
+          return;
+        return invoke("cli_install_helper");
+      })
+      .catch((e) => {
+        console.warn("atlas CLI helper refresh failed:", e);
+      });
   }, []);
 
   // Warm-launch CLI: when `atlas <path>` runs while Atlas is already open, the
@@ -399,22 +415,58 @@ export function App() {
       const cliPath = await invoke<string | null>("cli_take_initial_project_path").catch(
         () => null,
       );
-      try {
-        const payload = await invoke<AppStateWire>("bootstrap_app_state");
-        if (cancelled) return;
-        startTransition(() => {
-          useAppStore.getState().actions.hydrate(payload, { skipActiveSwitch: !!cliPath });
-          // Hydration replaces the org list wholesale, so re-apply any server
-          // orgs from a snapshot that may have already arrived — otherwise a
-          // sign-in that landed before this bootstrap would be overwritten.
-          const snap = useAuthStore.getState().snapshot;
-          if (snap.status === "signed-in" && snap.orgs) {
-            useOrgStore.getState().actions.mergeServerOrgs(snap.orgs);
+      // `bootstrap_app_state` is the only read of `state.json` Atlas ever
+      // performs, so a failure here is NOT "start empty and carry on": the
+      // stores keep their empty defaults, `AppState::apply_patch` replaces the
+      // persisted lists wholesale, and the unconditional quit flush would then
+      // write that emptiness over the user's real projects and orgs. Retry
+      // first — a transient IPC hiccup shouldn't cost a session.
+      let snapshot: AppStateWire | null = null;
+      for (let attempt = 1; attempt <= 3 && !snapshot; attempt++) {
+        try {
+          snapshot = await invoke<AppStateWire>("bootstrap_app_state");
+        } catch (e) {
+          console.warn(`bootstrap_app_state attempt ${attempt} failed:`, e);
+          if (attempt < 3) {
+            await new Promise((resolve) => setTimeout(resolve, 150 * attempt));
           }
-        });
-      } catch (e) {
-        console.warn("bootstrap_app_state failed; starting empty:", e);
-        if (!cancelled) {
+        }
+      }
+      if (cancelled) return;
+      try {
+        if (snapshot) {
+          const payload = snapshot;
+          startTransition(() => {
+            // The stores are about to hold the user's real state, so writing
+            // them back is safe from here on. Before this line they hold empty
+            // defaults and persistence is denied — see `appStateWritable`.
+            setAppStateWritable(true);
+            useAppStore.getState().actions.hydrate(payload, { skipActiveSwitch: !!cliPath });
+            // Hydration replaces the org list wholesale, so re-apply any server
+            // orgs from a snapshot that may have already arrived — otherwise a
+            // sign-in that landed before this bootstrap would be overwritten.
+            const snap = useAuthStore.getState().snapshot;
+            if (snap.status === "signed-in" && snap.orgs) {
+              useOrgStore.getState().actions.mergeServerOrgs(snap.orgs);
+            }
+          });
+        } else {
+          // Every attempt failed. Come up in an explicitly READ-ONLY session
+          // rather than letting the empty stores overwrite `state.json`: the
+          // user's projects and orgs are still on disk, and a restart is what
+          // brings them back. Without this the app looks merely "empty" and
+          // then makes that permanent on quit.
+          setAppStateWritable(false);
+          logEvent({
+            source: "atlas",
+            kind: "bootstrap-failed",
+            summary: "bootstrap_app_state failed after 3 attempts; app-state writes suspended",
+            status: "failure",
+          });
+          toast.error(
+            "Atlas couldn't load your projects. Your saved data is safe on disk — restart Atlas to get it back.",
+            { duration: Infinity },
+          );
           startTransition(() => {
             useAppStore.getState().actions.hydrate(
               {
@@ -428,7 +480,11 @@ export function App() {
         }
       } finally {
         if (!cancelled) {
-          if (cliPath) {
+          // Only open the CLI path when we actually have a snapshot. Without
+          // one there is no org to own the project, so `addProject` would
+          // refuse anyway — and its "no organisation" toast would bury the
+          // boot-failure one that actually tells the user what to do.
+          if (cliPath && snapshot) {
             logEvent({
               source: "atlas",
               kind: "cli-launch-open-project",
@@ -871,7 +927,7 @@ export function App() {
 
     // After a native-agent turn that may have changed files, refresh the
     // project's codebase index (incremental + structural — cheap, no LLM) so
-    // `search_memory` and the Memory tab stay current. Debounced per project so
+    // `memory_search` and the Memory tab stay current. Debounced per project so
     // a burst of turns triggers one rebuild.
     const indexTimers = new Map<string, ReturnType<typeof setTimeout>>();
     const autoIndexAfterTurn = (acpSessionId: string) => {
@@ -1280,6 +1336,18 @@ export function App() {
   // once — every push from Rust patches the mirror in place.
   useEffect(() => {
     ensureRecentFilesListener();
+  }, []);
+
+  // A session that answered without ever reading shared memory says so, once.
+  // Host-observed rather than agent-reported, so it rides its own event rather
+  // than the frozen delta wire.
+  useEffect(() => {
+    const unlisten = listenMemoryUnconsulted(({ sessionId }) => {
+      useChatStore.getState().actions.noteMemoryUnconsulted(sessionId);
+    });
+    return () => {
+      void unlisten.then((f) => f());
+    };
   }, []);
 
   // Quit durability: per-switch flushes are fire-and-forget, so on window

@@ -397,6 +397,10 @@ interface ChatActions {
     /** Reflect the mode the agent chose during session creation without
      *  treating it as an Atlas user override or sending a second RPC. */
     hydrateClaudePermissionMode: (sessionId: string, mode: ClaudePermissionMode) => void;
+    /** Say, once, that this session answered without ever reading shared
+     *  memory. Keyed by ACP session id because the host observes the session,
+     *  not the tab. */
+    noteMemoryUnconsulted: (acpSessionId: string) => void;
     setClaudePermissionMode: (sessionId: string, mode: ClaudePermissionMode) => void;
     /** A plan-approval option was answered: adopt the mode it selects (or
      *  `override`, for Atlas's own "approve and bypass") and push it to the
@@ -731,6 +735,14 @@ function findToolCall(
   }
   return null;
 }
+
+/** Shown when a turn ends and the agent never read shared memory.
+ *
+ *  A recorded fact exists precisely because it is NOT derivable from the code,
+ *  so an answer reasoned out from the repo can contradict one and look just as
+ *  confident. This does not stop that; it says when it might have happened. */
+export const MEMORY_UNCONSULTED_NOTICE =
+  "(shared memory was not consulted this session — this answer was not informed by anything previously recorded)";
 
 /** Human-readable end-of-turn notice for a stop reason, or null when the
  *  outcome speaks for itself (P2.4).
@@ -1127,6 +1139,15 @@ export const useChatStore = createSelectors(
           if (next) saveLastModePref("claude-code", next === "default" ? null : next);
           pushPermissionModeToAgent(get(), sessionId, previous);
         },
+        noteMemoryUnconsulted: (acpSessionId) =>
+          set((s) => {
+            const tabId = findTabByAcpSession(s.sessions, acpSessionId);
+            const session = tabId ? s.sessions[tabId] : undefined;
+            if (!session) return;
+            // Same shape as the other end-of-turn notices: a quiet aside in
+            // the transcript, where the answer it qualifies actually is.
+            session.messages.push(makeAssistantTextMessage(MEMORY_UNCONSULTED_NOTICE));
+          }),
         hydrateClaudePermissionMode: (sessionId, mode) =>
           set((s) => {
             const session = s.sessions[sessionId];
@@ -2202,9 +2223,18 @@ function applyDeltaToDraft(s: ChatDraft, env: AgentDelta): void {
       }
       const found = findToolCall(session, env.tool_call.id);
       if (found) {
+        // `toChatToolCall` mints a fresh record with no `startedAt`; assigning
+        // it over the existing one leaves the stamp from first sight in place,
+        // which is the whole point — the clock must not restart on the
+        // pending→running→completed updates for the same call.
         Object.assign(found.tc, toChatToolCall(env.tool_call));
         return;
       }
+      // First sight of this call: stamp the start the live elapsed figure
+      // counts from. The delta arrives when the agent announces the call, so
+      // this is its start to within one IPC hop.
+      const fresh = toChatToolCall(env.tool_call);
+      fresh.startedAt = Date.now();
       // Collapse consecutive tool calls into ONE assistant message
       // so the thread doesn't render N separate message-item boxes
       // (each with its own padding) for every Find/Read/Bash the
@@ -2217,12 +2247,10 @@ function applyDeltaToDraft(s: ChatDraft, env: AgentDelta): void {
       // message.
       const last = session.messages[session.messages.length - 1];
       if (last && last.role === "assistant" && last.mode === "tool") {
-        last.toolCalls.push(toChatToolCall(env.tool_call));
+        last.toolCalls.push(fresh);
         return;
       }
-      session.messages.push(
-        stampProducingModel(session, makeAssistantToolMessage(toChatToolCall(env.tool_call))),
-      );
+      session.messages.push(stampProducingModel(session, makeAssistantToolMessage(fresh)));
       return;
     }
     case "tool_call_output_chunk": {

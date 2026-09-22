@@ -23,6 +23,7 @@ import {
   DownloadCloud,
 } from "lucide-react";
 import { clampScale, SCALE_STEP, MIN_SCALE, MAX_SCALE, DEFAULT_SCALE } from "../lib/ui-scale";
+import { APP_ICONS } from "../lib/app-icons";
 import { AtlasIcon } from "@/components/atlas-icon";
 import { ProvidersSettings } from "./providers-settings";
 import { LayoutsSettings } from "./layouts-settings";
@@ -38,7 +39,7 @@ import { setEnabled as setTelemetryEnabled } from "@/features/telemetry/posthog-
 import { useFeedbackStore } from "@/features/feedback/stores/feedback-store";
 import { updater } from "@/features/updater/lib/updater-api";
 import { useUpdaterStore } from "@/features/updater/stores/updater-store";
-import { isWindows } from "@/lib/platform";
+import { isLinux, isWindows } from "@/lib/platform";
 import { useSettingsNav, type SettingsSection } from "../stores/settings-nav-store";
 import { openConfigFile } from "../lib/atlas-config-api";
 import { useSettingsStore } from "@/features/settings/stores/settings-store";
@@ -333,15 +334,18 @@ function GeneralSettings() {
       {isMac && (
         <SettingRow
           label="App icon"
-          description="Dark or light Liquid Glass icon. Changes the Dock icon while Atlas is running; Finder keeps the dark one."
+          description="Changes the icon in the Dock, Finder and Launchpad. Only the default is live Liquid Glass; the others are fixed renders of theirs."
         >
           <select
             value={settings.appIcon}
-            onChange={(e) => updateSettings({ appIcon: e.target.value as "dark" | "light" })}
+            onChange={(e) => updateSettings({ appIcon: e.target.value })}
             className="h-7 rounded-md border border-[var(--border)] bg-[var(--card)] px-2 text-xs text-[var(--foreground)] outline-none"
           >
-            <option value="dark">Dark</option>
-            <option value="light">Light</option>
+            {APP_ICONS.map((icon) => (
+              <option key={icon.id} value={icon.id}>
+                {icon.label}
+              </option>
+            ))}
           </select>
         </SettingRow>
       )}
@@ -674,7 +678,9 @@ function UpdatesSettings() {
         description={
           isWindows
             ? "Check for a newer version in the background and download the installer automatically. Windows asks for permission before it is installed. Turn off to never check or download."
-            : "Check for a newer version in the background and download it automatically. Updates are Apple-signed and notarized; Atlas verifies the signature before installing. Turn off to never check or download."
+            : isLinux
+              ? "Check for a newer version in the background. On Linux, update via your package manager (AUR, deb, rpm) or download the latest release asset. Turn off to never check."
+              : "Check for a newer version in the background and download it automatically. Updates are Apple-signed and notarized; Atlas verifies the signature before installing. Turn off to never check or download."
         }
       >
         <Toggle

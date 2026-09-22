@@ -20,7 +20,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 
 import type { AgentDelta, SessionMessage, ToolCall } from "@/types/agents";
 import type { SwitchableAgent } from "@/types/agent";
-import { useChatStore } from "./chat-store";
+import { MEMORY_UNCONSULTED_NOTICE, useChatStore } from "./chat-store";
 
 const TAB = "tab-1";
 const AGENT = "agent-1";
@@ -85,6 +85,27 @@ beforeEach(() => {
     pendingPermissions: {},
     queues: {},
     activeSessionId: null,
+  });
+});
+
+describe("the memory-not-consulted notice", () => {
+  // Host-observed, not agent-reported: it rides its own event rather than the
+  // frozen delta wire, so it is applied through the action directly.
+  it("says so in the thread, where the answer it qualifies is", () => {
+    boundTab();
+    useChatStore.getState().actions.noteMemoryUnconsulted(ACP);
+
+    expect(last()).toMatchObject({
+      role: "assistant",
+      content: MEMORY_UNCONSULTED_NOTICE,
+    });
+  });
+
+  it("is silent about a session it does not know", () => {
+    boundTab();
+    const before = messages().length;
+    useChatStore.getState().actions.noteMemoryUnconsulted("some-other-session");
+    expect(messages()).toHaveLength(before);
   });
 });
 
@@ -710,5 +731,28 @@ describe("applyAgentDelta: a whole turn, in wire order", () => {
     });
     // The full snapshot replaced the streamed result rather than doubling it.
     expect(messages()[3].toolCalls[0].result).toBe("a.ts\nb.ts\n");
+  });
+
+  // `startedAt` is the only field on a tool call the wire does not carry — the
+  // session-delta wire is frozen and has no start time, so the store stamps
+  // one. The live elapsed figure on a running block is read from it, which
+  // makes "stamped once, never restarted" the invariant worth pinning.
+  it("stamps a tool call's start on first sight and keeps it across updates", () => {
+    boundTab();
+    const before = Date.now();
+    apply(d("tool_call_upserted", { message_id: "t", tool_call: wireTool("tc1") }));
+    const startedAt = last().toolCalls[0].startedAt;
+    expect(startedAt).toBeGreaterThanOrEqual(before);
+
+    // The completion arrives as an upsert for the SAME id, and `toChatToolCall`
+    // mints a record without the field. If that overwrote the stamp the clock
+    // would reset on every status change the agent reported.
+    apply(
+      d("tool_call_upserted", {
+        message_id: "t",
+        tool_call: wireTool("tc1", { status: "completed", result: "ok" }),
+      }),
+    );
+    expect(last().toolCalls[0]).toMatchObject({ status: "completed", startedAt });
   });
 });
